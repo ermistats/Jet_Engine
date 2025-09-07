@@ -1,240 +1,360 @@
-#include <HX711_ADC.h>
-#include <DFRobot_MAX31855.h>
 #include <Wire.h>
-#include <ESP32Servo.h>
-#include <EEPROM.h>
-#include <math.h>
+#include <DFRobot_MAX31855.h>
+#include "HX711.h"
+#include <Servo.h>
 
 
-const int HX711_dout = 4;
-const int HX711_sck = 5;
-HX711_ADC LoadCell(HX711_dout, HX711_sck);
-const int calVal_eepromAdress = 0;
-float loadCellValue = 0;
-bool newDataReady = false;
+DFRobot_MAX31855 max31855;
 
 
-DFRobot_MAX31855 max31855(&Wire, 0x10);
-float temperatureC = 0;
-float lastTemperatureC = 0;
+const int   gasPin = A0;
+const float Vref   = 5.0;          // Use 3.3 if ADC reference is 3.3V
+const float RL     = 10.0;         // kΩ
+const float R0     = 2.0;          // kΩ (your calibrated clean-air)
+const float a      = 116.6020682;  // replace per your MQ model
+const float b      = -2.769034857;
 
 
-const int hydrogenPin = A0;
-int hydrogenAnalog = 0;
-float hydrogenPPM = 0;
+#define RELAY0_PIN 7
+#define RELAY1_PIN 9
+#define ACTIVE_LOW0 1            // 1: LOW = ON, 0: HIGH = ON
+#define ACTIVE_LOW1 1
+bool isOn0 = false;
+bool isOn1 = false;
+
+inline void setRelay0(bool on){
+  digitalWrite(RELAY0_PIN, (ACTIVE_LOW0 ? (on?LOW:HIGH) : (on?HIGH:LOW)));
+}
+inline void setRelay1(bool on){
+  digitalWrite(RELAY1_PIN, (ACTIVE_LOW1 ? (on?LOW:HIGH) : (on?HIGH:LOW)));
+}
 
 
-#define RL 10000.0
-#define VCC 3.3
-#define ADC_RESOLUTION 4095.0
-float R0 = 10000.0;
+#define HX_DT_PIN  2
+#define HX_SCK_PIN 3
+HX711 scale;
+
+enum LCState { LC_STREAM, LC_CAL_WAIT_WEIGHT };
+LCState lcState = LC_STREAM;
+
+bool waitReady(uint32_t timeout_ms){
+  uint32_t t0 = millis();
+  while (millis() - t0 < timeout_ms){
+    if (scale.is_ready()) return true;
+    delay(1);
+  }
+  return false;
+}
 
 
 Servo esc1, esc2;
-const int esc1Pin = 18; 
-const int esc2Pin = 19; 
-int throttlePercent1 = 0;
-int throttlePercent2 = 0;
+
+const int ESC1_PIN = 10;  // EDF1
+const int ESC2_PIN = 11;  // EDF2
+
+const int MIN_US = 1000;     
+const int MAX_US = 2000;    
+
+const int   RAMP_STEP_US = 6;     
+const unsigned long STEP_MS = 20;  
+
+int  esc1_target_us = MIN_US, esc2_target_us = MIN_US;
+int  esc1_current_us = MIN_US, esc2_current_us = MIN_US;
+unsigned long lastEscStep = 0;
+
+int pctToUs(float pct) {
+  if (pct < 0)   pct = 0;
+  if (pct > 100) pct = 100;
+  return (int)(MIN_US + (pct / 100.0f) * (MAX_US - MIN_US));
+}
+float usToPct(int us) {
+  if (us < MIN_US) us = MIN_US;
+  if (us > MAX_US) us = MAX_US;
+  return 100.0f * (us - MIN_US) / (MAX_US - MIN_US);
+}
+inline void writeESCs(int us1, int us2){
+  esc1.writeMicroseconds(us1);
+  esc2.writeMicroseconds(us2);
+}
+void escRampUpdate(){
+  unsigned long now = millis();
+  if (now - lastEscStep < STEP_MS) return;
+  lastEscStep = now;
+
+  // EDF1
+  if (esc1_current_us < esc1_target_us) {
+    esc1_current_us += RAMP_STEP_US;
+    if (esc1_current_us > esc1_target_us) esc1_current_us = esc1_target_us;
+  } else if (esc1_current_us > esc1_target_us) {
+    esc1_current_us -= RAMP_STEP_US;
+    if (esc1_current_us < esc1_target_us) esc1_current_us = esc1_target_us;
+  }
+
+  // EDF2
+  if (esc2_current_us < esc2_target_us) {
+    esc2_current_us += RAMP_STEP_US;
+    if (esc2_current_us > esc2_target_us) esc2_current_us = esc2_target_us;
+  } else if (esc2_current_us > esc2_target_us) {
+    esc2_current_us -= RAMP_STEP_US;
+    if (esc2_current_us < esc2_target_us) esc2_current_us = esc2_target_us;
+  }
+
+  writeESCs(esc1_current_us, esc2_current_us);
+}
 
 
-const int ESC_MIN_PULSE = 1000;
-const int ESC_MAX_PULSE = 2000;
+const int sensorPin = 4;   
+const int buzzerPin = 6;   
+
+#define LIQUID_ACTIVE_HIGH 0  
+#define BUZZER_ACTIVE_HIGH 1  
+#define USE_INPUT_PULLUP 1    
+
+unsigned long AUTO_TIMEOUT_SEC = 30; 
+
+enum BzMode { AUTO_MODE, MANUAL_ON, MANUAL_OFF };
+void applyBuzzer(bool on);
+void enterManual(BzMode m);
+// ----------------------------------------------------------------
+
+BzMode bzMode = AUTO_MODE;
+bool buzzerOn = false;
+unsigned long manualSince = 0;
+
+void applyBuzzer(bool on) {
+  buzzerOn = on;
+  if (BUZZER_ACTIVE_HIGH) digitalWrite(buzzerPin, on ? HIGH : LOW);
+  else                    digitalWrite(buzzerPin, on ? LOW  : HIGH);
+}
+void enterManual(BzMode m) {
+  bzMode = m;
+  applyBuzzer(m == MANUAL_ON);
+  manualSince = millis();
+}
 
 
-unsigned long lastPrintTime = 0;
-const unsigned long printInterval = 500;  // ms
+void handleCommand(const String& raw){
+  String cmd = raw; cmd.trim();
+  if (!cmd.length()) return;
+  String up = cmd; up.toUpperCase();
 
-void setup() {
+
+  if (up.startsWith("UALL")) {
+    long us = up.substring(4).toInt();
+    us = constrain(us, MIN_US, MAX_US);
+    esc1_target_us = esc2_target_us = (int)us;
+    Serial.print("ACK:UALL="); Serial.println(us);
+    return;
+  }
+  if (up.startsWith("U1")) {
+    long us = up.substring(2).toInt();
+    us = constrain(us, MIN_US, MAX_US);
+    esc1_target_us = (int)us;
+    Serial.print("ACK:U1="); Serial.println(us);
+    return;
+  }
+  if (up.startsWith("U2")) {
+    long us = up.substring(2).toInt();
+    us = constrain(us, MIN_US, MAX_US);
+    esc2_target_us = (int)us;
+    Serial.print("ACK:U2="); Serial.println(us);
+    return;
+  }
+
+
+  if (up.startsWith("ALL")) {
+    float pct = up.substring(3).toFloat();
+    pct = constrain(pct, 0, 100);
+    int us = pctToUs(pct);
+    esc1_target_us = esc2_target_us = us;
+    Serial.print("ACK:ALL="); Serial.print(pct,1); Serial.print("% ("); Serial.print(us); Serial.println("us)");
+    return;
+  }
+  if (up.startsWith("EDF1")) {
+    float pct = up.substring(4).toFloat();
+    pct = constrain(pct, 0, 100);
+    esc1_target_us = pctToUs(pct);
+    Serial.print("ACK:EDF1="); Serial.print(pct,1); Serial.print("% ("); Serial.print(esc1_target_us); Serial.println("us)");
+    return;
+  }
+  if (up.startsWith("EDF2")) {
+    float pct = up.substring(4).toFloat();
+    pct = constrain(pct, 0, 100);
+    esc2_target_us = pctToUs(pct);
+    Serial.print("ACK:EDF2="); Serial.print(pct,1); Serial.print("% ("); Serial.print(esc2_target_us); Serial.println("us)");
+    return;
+  }
+
+
+  if (up == "ON")  { isOn0 = true;  setRelay0(true);  Serial.println("ACK:ON");  return; }
+  if (up == "OFF") { isOn0 = false; setRelay0(false); Serial.println("ACK:OFF"); return; }
+  if (up == "ON1") { isOn1 = true;  setRelay1(true);  Serial.println("ACK:ON1"); return; }
+  if (up == "OFF1"){ isOn1 = false; setRelay1(false); Serial.println("ACK:OFF1");return; }
+
+
+  if (up == "T"){
+    if (waitReady(2000)) scale.tare();
+    Serial.println("TARED:ENTER_KNOWN_GRAMS");
+    lcState = LC_CAL_WAIT_WEIGHT;
+    return;
+  }
+  if (lcState == LC_CAL_WAIT_WEIGHT){
+    float known_g = cmd.toFloat();
+    if (known_g > 0.0f){
+      if (!waitReady(2000)){
+        Serial.println("ERR:HX711_NOT_READY");
+      } else {
+        long net = scale.get_value(20);   
+        if (net == 0){
+          Serial.println("ERR:CAL_ZERO_NET");
+        } else {
+          float cal = (float)net / known_g;  
+          scale.set_scale(cal);
+          float test = scale.get_units(10);
+          if (test < 0){ cal = -cal; scale.set_scale(cal); test = scale.get_units(10); }
+          Serial.print("ACK:CAL="); Serial.println(cal, 6);
+          Serial.print("CHECK_G="); Serial.println(test, 2);
+        }
+      }
+      lcState = LC_STREAM; 
+    } else {
+      Serial.println("ERR:ENTER_POSITIVE_GRAMS");
+    }
+    return;
+  }
+
+
+  if (up == "SOUNDON")  { enterManual(MANUAL_ON);  Serial.println("ACK:SOUNDON");  return; }
+  if (up == "SOUNDOFF") { enterManual(MANUAL_OFF); Serial.println("ACK:SOUNDOFF"); return; }
+  if (up == "AUTO")     { bzMode = AUTO_MODE;      Serial.println("ACK:AUTO");     return; }
+
+  if (up.startsWith("AUTOAFTER")) {
+    int sp = up.indexOf(' ');
+    if (sp > 0) {
+      long secs = up.substring(sp + 1).toInt();
+      if (secs >= 0) {
+        AUTO_TIMEOUT_SEC = (unsigned long)secs;
+        if (bzMode != AUTO_MODE) manualSince = millis();
+        Serial.print("ACK:AUTOAFTER="); Serial.print(secs); Serial.println("s");
+        return;
+      }
+    }
+    Serial.println("ERR:USE AUTOAFTER <seconds>");
+    return;
+  }
+  if (up == "NOTIMEOUT") {
+    AUTO_TIMEOUT_SEC = 0;
+    Serial.println("ACK:NOTIMEOUT");
+    return;
+  }
+
+
+  if (lcState == LC_STREAM) {
+    float pct = cmd.toFloat();
+    if (pct >= 0 || cmd == "0") {
+      pct = constrain(pct, 0, 100);
+      int us = pctToUs(pct);
+      esc1_target_us = esc2_target_us = us;
+      Serial.print("ACK:ALL="); Serial.print(pct,1); Serial.print("% ("); Serial.print(us); Serial.println("us)");
+    }
+  }
+}
+
+
+void setup(){
   Serial.begin(9600);
 
-  LoadCell.begin();
-  bool _tare = true;
-  LoadCell.start(2000, _tare);
-  if (LoadCell.getTareTimeoutFlag() || LoadCell.getSignalTimeoutFlag()) {
-    Serial.println("HX711 timeout. Check wiring.");
-    while (1);
-  } else {
-    float storedCal = 1.0;
-    EEPROM.get(calVal_eepromAdress, storedCal);
-    LoadCell.setCalFactor(storedCal);
-    Serial.print("Load Cell ready. Calibration factor: ");
-    Serial.println(storedCal);
-  }
-  while (!LoadCell.update());
 
-
+  Wire.begin();
   max31855.begin();
 
 
-  esc1.setPeriodHertz(50);
-  esc2.setPeriodHertz(50);
-  esc1.attach(esc1Pin, ESC_MIN_PULSE, ESC_MAX_PULSE);
-  esc2.attach(esc2Pin, ESC_MIN_PULSE, ESC_MAX_PULSE);
-  esc1.writeMicroseconds(ESC_MIN_PULSE);
-  esc2.writeMicroseconds(ESC_MIN_PULSE);
-  Serial.println("ESCs armed.");
-  setThrottlePercent(1, 0);
-  setThrottlePercent(2, 0);
-}
+  pinMode(RELAY0_PIN, OUTPUT);
+  pinMode(RELAY1_PIN, OUTPUT);
+  setRelay0(false);
+  setRelay1(false);
 
-void loop() {
-  // Load Cell
-  if (LoadCell.update()) newDataReady = true;
-  if (newDataReady) {
-    loadCellValue = LoadCell.getData();
-    newDataReady = false;
-  }
 
-  // Temperature
-  float temp = max31855.readCelsius();
-  if (temp != 0) {
-    temperatureC = temp;
-    lastTemperatureC = temp;
-  } else {
-    temperatureC = lastTemperatureC;
-  }
+  scale.begin(HX_DT_PIN, HX_SCK_PIN);
+  scale.set_scale(1.0);
+  scale.tare();
 
-  // Hydrogen
-  hydrogenAnalog = analogRead(hydrogenPin);
-  hydrogenPPM = getHydrogenPPM(hydrogenAnalog);
 
-  // Serial Plotter Output
-  if (millis() - lastPrintTime > printInterval) {
-    Serial.print("Hydrogen:");
-    Serial.print(hydrogenPPM);
-    Serial.print("\tKg:");
-    Serial.print(loadCellValue);
-    Serial.print("\t");
-    Serial.print(temperatureC);
-    Serial.print("°C");
-    Serial.print("\tThrottle1:");
-    Serial.print(throttlePercent1);
-    Serial.print("\tThrottle2:");
-    Serial.println(throttlePercent2);
-    lastPrintTime = millis();
-  }
+  esc1.attach(ESC1_PIN);
+  esc2.attach(ESC2_PIN);
+  writeESCs(MIN_US, MIN_US);  
+  delay(6000);                
+  esc1_current_us = esc1_target_us = MIN_US;
+  esc2_current_us = esc2_target_us = MIN_US;
+  writeESCs(esc1_current_us, esc2_current_us);
 
-  if (Serial.available() > 0) {
-    char inByte = Serial.read();
 
-    if (inByte == 't') {
-      LoadCell.tareNoDelay();
-      Serial.println("Taring...");
-    } else if (inByte == 'c') {
-      Serial.println("Send new calibration factor:");
-      while (Serial.available() == 0);
-      float newCal = Serial.parseFloat();
-      if (newCal != 0) {
-        LoadCell.setCalFactor(newCal);
-        EEPROM.put(calVal_eepromAdress, newCal);
-        Serial.print("New calibration factor saved: ");
-        Serial.println(newCal);
-      }
-    } else if (inByte == 'r') {
-      calibrate();
-    } else if (inByte == 'm') {
-      while (Serial.available() == 0);
-      int motorID = Serial.parseInt();
-      while (Serial.available() == 0);
-      int percent = Serial.parseInt();
-      setThrottlePercent(motorID, percent);
-    }
-  }
+#if USE_INPUT_PULLUP
+  pinMode(sensorPin, INPUT_PULLUP);
+#else
+  pinMode(sensorPin, INPUT);
+#endif
+  pinMode(buzzerPin, OUTPUT);
+  applyBuzzer(false);
 
-  if (LoadCell.getTareStatus() == true) {
-    Serial.println("Tare complete.");
-  }
-}
-
-float getHydrogenPPM(int analogValue) {
-  float Vout = (analogValue / ADC_RESOLUTION) * VCC;
-  float Rs = (VCC - Vout) * RL / Vout;
-  float ratio = Rs / R0;
-  float ppm = pow(10, (-0.45 * log10(ratio) + 0.72));
-  return ppm;
-}
-
-void calibrate() {
-  Serial.println("*** Calibration Mode ***");
-  Serial.println("Step 1: Remove any weight from the load cell.");
-  Serial.println("Send 't' to tare (set zero baseline).\n");
-
-  bool tared = false;
-  while (!tared) {
-    LoadCell.update();
-    if (Serial.available()) {
-      if (Serial.read() == 't') {
-        LoadCell.tareNoDelay();
-        while (!LoadCell.getTareStatus()) LoadCell.update();
-        Serial.println("Tare complete.\n");
-        tared = true;
-      }
-    }
-  }
-
-  Serial.println("Step 2: Place a known weight on the scale.");
-  Serial.println("Send the exact weight in grams (e.g., 100.0):\n");
-
-  float known_mass = 0;
-  bool gotWeight = false;
-  while (!gotWeight) {
-    LoadCell.update();
-    if (Serial.available()) {
-      known_mass = Serial.parseFloat();
-      if (known_mass > 0) {
-        gotWeight = true;
-        Serial.print("Known weight received: ");
-        Serial.println(known_mass);
-      }
-    }
-  }
-
-  LoadCell.refreshDataSet();
-  float newCal = LoadCell.getNewCalibration(known_mass);
-  LoadCell.setCalFactor(newCal);
-
-  Serial.print("New calibration factor: ");
-  Serial.println(newCal);
-  Serial.println("Save this to EEPROM? Send 'y' to save, 'n' to skip.\n");
-
-  bool saveDone = false;
-  while (!saveDone) {
-    if (Serial.available()) {
-      char inByte = Serial.read();
-      if (inByte == 'y') {
-        EEPROM.put(calVal_eepromAdress, newCal);
-        Serial.println("Calibration factor saved to EEPROM.\n");
-        saveDone = true;
-      } else if (inByte == 'n') {
-        Serial.println("Calibration not saved.\n");
-        saveDone = true;
-      }
-    }
-  }
-
-  Serial.println("*** Calibration Complete ***\n");
+  Serial.println("READY");
+  Serial.println("Commands: ON/OFF, ON1/OFF1, T(+grams), EDF1 <pct>, EDF2 <pct>, ALL <pct>, U1 <us>, U2 <us>, UALL <us>, SOUNDON, SOUNDOFF, AUTO, AUTOAFTER <sec>, NOTIMEOUT");
 }
 
 
-void setThrottlePercent(int motorID, int percent) {
-  if (percent < 0) return;
-  if (percent > 100) percent = 100;
+void loop(){
 
-  int pulse = map(percent, 0, 100, ESC_MIN_PULSE, ESC_MAX_PULSE);
-
-  if (motorID == 1) {
-    esc1.writeMicroseconds(pulse);
-    throttlePercent1 = percent;
-  } else if (motorID == 2) {
-    esc2.writeMicroseconds(pulse);
-    throttlePercent2 = percent;
+  if (Serial.available() > 0){
+    String line = Serial.readStringUntil('\n');
+    handleCommand(line);
   }
 
-  Serial.print("Motor ");
-  Serial.print(motorID);
-  Serial.print(" throttle set to ");
-  Serial.print(percent);
-  Serial.print("% (");
-  Serial.print(pulse);
-  Serial.println(" µs)");
+
+  float tempC = max31855.readCelsius();
+
+  int adcValue = analogRead(gasPin);
+  float Vout = (adcValue / 1023.0) * Vref;
+  float RS = (Vout > 0.001f) ? ((Vref - Vout) * RL / Vout) : 1e9;
+  float ratio = RS / R0;
+  float ppm = a * pow(ratio, b);
+
+  float grams = 0.0f;
+  if (lcState == LC_STREAM && scale.is_ready()){
+    grams = scale.get_units(5);
+  }
+
+
+  escRampUpdate();
+
+
+  int raw = digitalRead(sensorPin);
+  bool liquidDetected = (raw == (LIQUID_ACTIVE_HIGH ? HIGH : LOW));
+  if (bzMode == AUTO_MODE) {
+    applyBuzzer(liquidDetected);
+  } else if (AUTO_TIMEOUT_SEC > 0) {
+    if (millis() - manualSince >= AUTO_TIMEOUT_SEC * 1000UL) {
+      bzMode = AUTO_MODE;
+      Serial.println("ACK:AUTO_TIMEOUT");
+    }
+  }
+
+
+  if (lcState == LC_STREAM){
+
+    Serial.print(tempC, 2);  Serial.print(", ");
+    Serial.print(ppm, 3);    Serial.print(", ");
+    Serial.print(isOn0 ? "ON" : "OFF"); Serial.print(", ");
+    Serial.print(isOn1 ? "ON" : "OFF"); Serial.print(", ");
+    Serial.print(grams, 2);  Serial.print(", ");
+
+    Serial.print(usToPct(esc1_current_us), 1); Serial.print(", ");
+    Serial.print(esc1_current_us);             Serial.print(", ");
+    Serial.print(usToPct(esc2_current_us), 1); Serial.print(", ");
+    Serial.print(esc2_current_us);             Serial.print(", ");
+
+    Serial.print(liquidDetected ? "YES" : "NO"); Serial.print(", ");
+    Serial.println(buzzerOn ? "ON" : "OFF");
+  }
+
+  delay(200); 
 }
